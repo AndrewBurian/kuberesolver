@@ -7,6 +7,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
 
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -16,9 +17,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"google.golang.org/grpc/resolver"
+
+	"github.com/go-logr/logr"
 )
 
 const DefaultScheme = "kube"
@@ -29,7 +33,6 @@ type KubeResolveBuilder struct {
 
 	serviceNamespace string
 	portName         string
-	port             int32
 
 	managerClient     client.Client
 	restConfig        *rest.Config
@@ -94,12 +97,14 @@ func (b *KubeResolveBuilder) Build(target resolver.Target, cc resolver.ClientCon
 	buildLog := b.controllerManager.GetLogger().WithName("Build").WithValues("target", target.URL.Redacted())
 
 	ctx := b.runtimeContext
-	
+
 	res := new(KubeResolver)
 	res.grpcSecurityProtocol = opts.DialCreds.Info().SecurityProtocol
 	res.runtimeManager = b.controllerManager
 	res.clientConn = cc
 	ctx, res.closeFunc = context.WithCancel(ctx)
+	res.defaultPortName = b.portName
+	res.startSync = make(chan interface{})
 
 	//TODO parse service name/namespace
 	res.Service.Name = "myservice"
@@ -107,6 +112,18 @@ func (b *KubeResolveBuilder) Build(target resolver.Target, cc resolver.ClientCon
 
 	runtimeController, err := controller.NewUnmanaged("kuberesolver", b.controllerManager, controller.Options{
 		Reconciler: res,
+		LogConstructor: func(req *reconcile.Request) logr.Logger {
+			log := b.controllerManager.GetLogger().WithName("kuberesolver").WithValues(
+				"target", target.URL.Redacted(),
+			)
+			if req != nil {
+				log = log.WithValues(
+					"object", klog.KRef(req.Namespace, req.Name),
+					"namespace", req.Namespace, "name", req.Name,
+				)
+			}
+			return log
+		},
 	})
 	if err != nil {
 		buildLog.Error(err, "Error creating unmanaged controller")
@@ -135,6 +152,7 @@ func (b *KubeResolveBuilder) Build(target resolver.Target, cc resolver.ClientCon
 		}
 	}()
 
+	// wait for first resolution
 	return res, nil
 }
 
@@ -160,6 +178,12 @@ func WithClient(cli client.Client) KubeResolveBuilderOption {
 func WithDefaultNamespace(ns string) KubeResolveBuilderOption {
 	return func(k *KubeResolveBuilder) {
 		k.serviceNamespace = ns
+	}
+}
+
+func WithDefaultPortName(name string) KubeResolveBuilderOption {
+	return func(k *KubeResolveBuilder) {
+		k.portName = name
 	}
 }
 

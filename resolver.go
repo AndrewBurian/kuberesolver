@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync/atomic"
 
+	"github.com/go-logr/logr"
 	wrr "google.golang.org/grpc/balancer/weightedroundrobin"
 	"google.golang.org/grpc/resolver"
 	corev1 "k8s.io/api/core/v1"
@@ -33,10 +35,15 @@ type KubeResolver struct {
 	closeFunc func()
 
 	serviceListOptions []client.ListOption
+
+	defaultPortName string
+
+	started   atomic.Bool
+	startSync chan interface{}
 }
 
-// DefaultPortName is used for targets when no port name or number suffix is set on the `kube:///service[:port]` target
-// and the resolver wasn't built with either of WithDefaultPortName or WithDefaultPort.
+// DefaultPortName is used for targets when no port name or number suffix is set on the `kube:///service[:port]` target.
+// Can be overridden by the builder option WithDefaultPortName.
 const DefaultPortName = "grpc"
 
 var _ resolver.Resolver = &KubeResolver{}
@@ -50,10 +57,11 @@ func (r *KubeResolver) Close() {
 // and makes this concurrency safe
 func (r *KubeResolver) ResolveNow(resolver.ResolveNowOptions) {
 
-	_, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: r.Service.Namespace}})
-	if err != nil {
-		r.clientConn.ReportError(err)
+	if r.started.Load() {
+		return
 	}
+	// block until started
+	<-r.startSync
 }
 
 func (r *KubeResolver) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
@@ -72,10 +80,11 @@ func (r *KubeResolver) Reconcile(ctx context.Context, req reconcile.Request) (re
 	endpointSliceList := new(discoveryv1.EndpointSliceList)
 
 	var result reconcile.Result
-	var state resolver.State
 
 	if cacheReady := r.runtimeManager.GetCache().WaitForCacheSync(ctx); !cacheReady {
-		return result, fmt.Errorf("client cache failed to sync")
+		err := fmt.Errorf("client cache failed to sync")
+		reconcileLog.Error(err, "Cannot reconcile without client caches")
+		return result, err
 	}
 
 	reconcileLog.V(2).Info("Listing EndpointSlices")
@@ -90,6 +99,30 @@ func (r *KubeResolver) Reconcile(ctx context.Context, req reconcile.Request) (re
 		result.Requeue = true
 		return result, fmt.Errorf("error listing endpointslices: %w", err)
 	}
+
+	state := r.createState(endpointSliceList, reconcileLog)
+
+	reconcileLog.V(2).Info("Updating resolver state")
+	err = r.clientConn.UpdateState(state)
+	if err != nil {
+		// errors from UpdateState can be ignored if the re-resolving won't change the outcome
+		reconcileLog.Error(err, "Resolver state update errored. Will not retry")
+		result.Requeue = false
+		return result, fmt.Errorf("error updating client state: %w", err)
+	}
+
+	if r.started.CompareAndSwap(false, true) {
+		close(r.startSync)
+	}
+
+	reconcileLog.V(1).Info("Reconcile complete successfully", "addressCount", len(state.Addresses))
+	return result, nil
+
+}
+
+func (r *KubeResolver) createState(endpointSliceList *discoveryv1.EndpointSliceList, reconcileLog logr.Logger) resolver.State {
+
+	var state resolver.State
 
 	for _, slice := range endpointSliceList.Items {
 
@@ -229,13 +262,5 @@ func (r *KubeResolver) Reconcile(ctx context.Context, req reconcile.Request) (re
 		}
 	}
 
-	reconcileLog.V(2).Info("Updating resolver state")
-	err = r.clientConn.UpdateState(state)
-	if err != nil {
-		// errors from UpdateState can be ignored if the re-resolving won't change the outcome
-		reconcileLog.Error(err, "Resolver state update errored. Will not retry")
-	}
-
-	reconcileLog.V(1).Info("Reconcile complete successfully", "addressCount", len(state.Addresses))
-	return result, nil
+	return state
 }

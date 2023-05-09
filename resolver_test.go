@@ -1,62 +1,283 @@
 package kuberesolver
 
 import (
-	"context"
 	"fmt"
-	"net/url"
 	"testing"
-	"time"
 
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/resolver"
 
 	discoveryv1 "k8s.io/api/discovery/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/go-logr/logr/testr"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-type clientConnRecorder struct {
-	resolver.ClientConn
+func TestStateConstruction(t *testing.T) {
 
-	updates []*resolver.State
-	err     error
-}
+	var testcases = []struct {
+		name        string
+		cluster     discoveryv1.EndpointSliceList
+		expectState resolver.State
+	}{
+		{
+			name:        "empty state",
+			cluster:     discoveryv1.EndpointSliceList{},
+			expectState: resolver.State{},
+		},
+		{
+			name: "simple state",
+			cluster: discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{
+					{
+						AddressType: discoveryv1.AddressTypeIPv4,
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								Addresses: []string{"10.0.0.1"},
+							},
+						},
+						Ports: []discoveryv1.EndpointPort{
+							{
+								Name: &grpcPortName,
+								Port: &grpcPortNo,
+							},
+						},
+					},
+				},
+			},
+			expectState: resolver.State{
+				Addresses: []resolver.Address{
+					{
+						Addr: "10.0.0.1:8001",
+					},
+				},
+			},
+		},
+		{
+			name: "extra addresses",
+			cluster: discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{
+					{
+						AddressType: discoveryv1.AddressTypeIPv4,
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								Addresses: []string{"10.0.0.1", "9.9.9.9", "ignored addr"},
+							},
+						},
+						Ports: []discoveryv1.EndpointPort{
+							{
+								Name: &grpcPortName,
+								Port: &grpcPortNo,
+							},
+						},
+					},
+				},
+			},
+			expectState: resolver.State{
+				Addresses: []resolver.Address{
+					{
+						Addr: "10.0.0.1:8001",
+					},
+				},
+			},
+		},
+		{
+			name: "extra ports",
+			cluster: discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{
+					{
+						AddressType: discoveryv1.AddressTypeIPv4,
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								Addresses: []string{"10.0.0.1"},
+							},
+						},
+						Ports: []discoveryv1.EndpointPort{
+							{
+								Name: &otherPortName,
+								Port: &grpcPortNoAlt,
+							},
+							{
+								Name: &grpcPortName,
+								Port: &grpcPortNo,
+							},
+						},
+					},
+				},
+			},
+			expectState: resolver.State{
+				Addresses: []resolver.Address{
+					{
+						Addr: "10.0.0.1:8001",
+					},
+				},
+			},
+		},
+		{
+			name: "unready endpoints",
+			cluster: discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{
+					{
+						AddressType: discoveryv1.AddressTypeIPv4,
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								Addresses: []string{"10.0.0.1"},
+								Conditions: discoveryv1.EndpointConditions{
+									Ready: &isReady,
+								},
+							},
+							{
+								Addresses: []string{"9.9.9.9"},
+								Conditions: discoveryv1.EndpointConditions{
+									Ready: &isNotReady,
+								},
+							},
+						},
+						Ports: []discoveryv1.EndpointPort{
+							{
+								Name: &grpcPortName,
+								Port: &grpcPortNo,
+							},
+						},
+					},
+				},
+			},
+			expectState: resolver.State{
+				Addresses: []resolver.Address{
+					{
+						Addr: "10.0.0.1:8001",
+					},
+				},
+			},
+		},
+		{
+			name: "multiple slices",
+			cluster: discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{
+					{
+						AddressType: discoveryv1.AddressTypeIPv4,
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								Addresses: []string{"10.0.0.1"},
+							},
+						},
+						Ports: []discoveryv1.EndpointPort{
+							{
+								Name: &grpcPortName,
+								Port: &grpcPortNo,
+							},
+						},
+					},
+					{
+						AddressType: discoveryv1.AddressTypeIPv4,
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								Addresses: []string{"10.0.0.2"},
+							},
+						},
+						Ports: []discoveryv1.EndpointPort{
+							{
+								Name: &grpcPortName,
+								Port: &grpcPortNo,
+							},
+						},
+					},
+				},
+			},
+			expectState: resolver.State{
+				Addresses: []resolver.Address{
+					{
+						Addr: "10.0.0.1:8001",
+					},
+					{
+						Addr: "10.0.0.2:8001",
+					},
+				},
+			},
+		},
+		{
+			name: "multiple endpoint slice",
+			cluster: discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{
+					{
+						AddressType: discoveryv1.AddressTypeIPv4,
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								Addresses: []string{"10.0.0.1"},
+							},
+							{
+								Addresses: []string{"10.0.0.2"},
+							},
+						},
+						Ports: []discoveryv1.EndpointPort{
+							{
+								Name: &grpcPortName,
+								Port: &grpcPortNo,
+							},
+						},
+					},
+				},
+			},
+			expectState: resolver.State{
+				Addresses: []resolver.Address{
+					{
+						Addr: "10.0.0.1:8001",
+					},
+					{
+						Addr: "10.0.0.2:8001",
+					},
+				},
+			},
+		},
+		{
+			name: "multiple slices with different ports",
+			cluster: discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{
+					{
+						AddressType: discoveryv1.AddressTypeIPv4,
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								Addresses: []string{"10.0.0.1"},
+							},
+						},
+						Ports: []discoveryv1.EndpointPort{
+							{
+								Name: &grpcPortName,
+								Port: &grpcPortNo,
+							},
+						},
+					},
+					{
+						AddressType: discoveryv1.AddressTypeIPv4,
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								Addresses: []string{"10.0.0.2"},
+							},
+						},
+						Ports: []discoveryv1.EndpointPort{
+							{
+								Name: &grpcPortName,
+								Port: &grpcPortNoAlt,
+							},
+						},
+					},
+				},
+			},
+			expectState: resolver.State{
+				Addresses: []resolver.Address{
+					{
+						Addr: "10.0.0.1:8001",
+					},
+					{
+						Addr: "10.0.0.2:8002",
+					},
+				},
+			},
+		},
+	}
 
-func (c *clientConnRecorder) UpdateState(s resolver.State) error {
-	c.updates = append(c.updates, &s)
-	return nil
-}
+	r := new(KubeResolver)
 
-func (c *clientConnRecorder) ReportError(e error) {
-	c.err = e
-}
-
-func (c *clientConnRecorder) state() (resolver.State, error) {
-	return *c.updates[len(c.updates)-1], c.err
-}
-
-var (
-	isReady    = true
-	isNotReady = false
-)
-
-var (
-	grpcPortName  = "grpc"
-	otherPortName = "metrics"
-)
-
-var (
-	grpcPortNo    = int32(8001)
-	grpcPortNoAlt = int32(8002)
-)
-
-func TestInitialReconcile(t *testing.T) {
-
-	verbosity := 1
+	verbosity := 0
 	if testing.Verbose() {
 		verbosity = 3
 	}
@@ -64,166 +285,58 @@ func TestInitialReconcile(t *testing.T) {
 		Verbosity: verbosity,
 	}))
 
-	endpointSlices := []client.Object{
-		&discoveryv1.EndpointSlice{
-			ObjectMeta: v1.ObjectMeta{
-				Name:      "slice-a",
-				Namespace: "default",
-				Labels: map[string]string{
-					discoveryv1.LabelServiceName: "myservice",
-				},
-			},
-			AddressType: discoveryv1.AddressTypeIPv4,
-			Endpoints: []discoveryv1.Endpoint{
-				{Addresses: []string{"10.0.0.1", "66.66.66.66"}},
-			},
-			Ports: []discoveryv1.EndpointPort{
-				{
-					Name: &grpcPortName,
-					Port: &grpcPortNo,
-				},
-			},
-		},
+	for i := range testcases {
+		test := testcases[i]
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			state := r.createState(&test.cluster, log.Log.WithName(t.Name()))
+			if err := compareStates(state, test.expectState); err != nil {
+				t.Error(err)
+			}
+		})
 
-		&discoveryv1.EndpointSlice{
-			ObjectMeta: v1.ObjectMeta{
-				Name:      "slice-b",
-				Namespace: "default",
-				Labels: map[string]string{
-					discoveryv1.LabelServiceName: "myservice",
-				},
-			},
-			AddressType: discoveryv1.AddressTypeIPv4,
-			Endpoints: []discoveryv1.Endpoint{
-				{Addresses: []string{"10.0.0.2", "66.66.66.66"}},
-			},
-			Ports: []discoveryv1.EndpointPort{
-				{
-					Name: &grpcPortName,
-					Port: &grpcPortNoAlt,
-				},
-			},
-		},
-	}
-
-	var expectedState = resolver.State{
-		Addresses: []resolver.Address{{Addr: "10.0.0.1:8001"}, {Addr: "10.0.0.2:8002"}},
-	}
-
-	testenv := new(envtest.Environment)
-	testenv.BinaryAssetsDirectory = "/Users/andrewburian/Library/Application Support/io.kubebuilder.envtest/k8s/1.27.1-darwin-arm64"
-	cfg, err := testenv.Start()
-	if err != nil {
-		t.Fatalf("Error starting test environment: %s", err)
-	}
-	defer testenv.Stop()
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-	defer cancel()
-
-	kubeClient, err := client.New(cfg, client.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for i := range endpointSlices {
-		if err = kubeClient.Create(ctx, endpointSlices[i], client.FieldOwner("test-runner")); err != nil {
-			t.Fatalf("Error creating starting data: %s", err)
-		}
-	}
-
-	resolveBuilder, err := NewKubeResolveBuilder(
-		WithRestConfig(cfg),
-		WithContext(ctx),
-	)
-	if err != nil {
-		t.Fatalf("Error creating resolve builder: %s", err)
-	}
-
-	target := resolver.Target{
-		URL: url.URL{
-			Scheme: "kube",
-			Host:   "myservice.mynamespace:grpc",
-		},
-	}
-
-	conn := new(clientConnRecorder)
-
-	// GRPC's process
-	// syncronously create a resolution helper
-	resolve, err := resolveBuilder.Build(target, conn, resolver.BuildOptions{
-		DialCreds: insecure.NewCredentials(),
-	})
-	if err != nil {
-		t.Fatalf("Failed to build resolver: %s", err)
-	}
-
-	// when calling GRPC.Dail, synchronously call ResolveNow
-	resolve.ResolveNow(struct{}{})
-
-	if conn.err != nil {
-		t.Fatalf("Resolver reported error: %s", conn.err)
-	}
-
-	// let the dust settle
-	time.Sleep(2 * time.Second)
-
-	if len(conn.updates) == 0 {
-		t.Fatal("Did not get updated state from resolver")
-	}
-
-	if err = conn.checkState(expectedState); err != nil {
-		t.Fatal(err.Error())
-	}
-
-	// Updates to the API should automatically re-resolve
-	newSlice := &discoveryv1.EndpointSlice{
-		ObjectMeta: v1.ObjectMeta{
-			Name:      "slice-c",
-			Namespace: "default",
-			Labels: map[string]string{
-				discoveryv1.LabelServiceName: "myservice",
-			},
-		},
-		AddressType: discoveryv1.AddressTypeIPv4,
-		Endpoints: []discoveryv1.Endpoint{
-			{Addresses: []string{"10.0.0.3", "66.66.66.66"}},
-		},
-		Ports: []discoveryv1.EndpointPort{
-			{
-				Name: &grpcPortName,
-				Port: &grpcPortNo,
-			},
-		},
-	}
-	if err = kubeClient.Create(ctx, newSlice); err != nil {
-		t.Fatalf("Client create errored: %s", err)
-	}
-
-	expectedState.Addresses = append(expectedState.Addresses, resolver.Address{Addr: "10.0.0.3:8001"})
-
-	time.Sleep(2 * time.Second)
-
-	if err = conn.checkState(expectedState); err != nil {
-		t.Fatal(err)
 	}
 }
 
-func (c *clientConnRecorder) checkState(expect resolver.State) error {
-	state, err := c.state()
+func compareStates(state, expect resolver.State) error {
 
-	if err != nil {
-		return err
-	}
-
+	// Check all addresses
 	if got, exp := len(state.Addresses), len(expect.Addresses); got != exp {
 		return fmt.Errorf("Wrong number of addresses, expected %d got %d", exp, got)
 	}
 
+	expectAddrToStateIndex := make(map[string]int)
+	for i := range expect.Addresses {
+		expectAddrToStateIndex[expect.Addresses[i].Addr] = -1
+	}
 	for i := range state.Addresses {
-		if got, exp := state.Addresses[i].Addr, expect.Addresses[i].Addr; exp != got {
-			return fmt.Errorf("Wrong address at index %d, expected %s got %s", i, exp, got)
+		index, found := expectAddrToStateIndex[state.Addresses[i].Addr]
+		if !found {
+			return fmt.Errorf("Unexpected address in state: %s", state.Addresses[i].Addr)
 		}
+		if index >= 0 {
+			return fmt.Errorf("Duplicate address in state: %s", state.Addresses[i].Addr)
+		}
+
+		expectAddrToStateIndex[state.Addresses[i].Addr] = i
+	}
+	for addr, index := range expectAddrToStateIndex {
+		if index == -1 {
+			return fmt.Errorf("Missing address in state: %s", addr)
+		}
+	}
+
+	// check balance attrs
+	for i := range expect.Addresses {
+		stateIndex := expectAddrToStateIndex[expect.Addresses[i].Addr]
+		if !expect.Addresses[i].BalancerAttributes.Equal(state.Addresses[stateIndex].BalancerAttributes) {
+			return fmt.Errorf("Balance attributes for %s aren't equal", state.Addresses[i].Addr)
+		}
+	}
+
+	// Check attributes
+	if !expect.Attributes.Equal(state.Attributes) {
+		return fmt.Errorf("State attributes aren't equal")
 	}
 
 	return nil
