@@ -175,6 +175,12 @@ func (b *KubeResolveBuilder) Scheme() string {
 	return b.schemeName
 }
 
+func WithScheme(scheme string) KubeResolveBuilderOption {
+	return func(k *KubeResolveBuilder) {
+		k.schemeName = scheme
+	}
+}
+
 func WithContext(ctx context.Context) KubeResolveBuilderOption {
 	return func(k *KubeResolveBuilder) {
 		k.runtimeContext = ctx
