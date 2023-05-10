@@ -3,6 +3,9 @@ package kuberesolver
 import (
 	"context"
 	"fmt"
+	"net"
+	"strconv"
+	"strings"
 
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -28,15 +31,16 @@ import (
 const DefaultScheme = "kube"
 
 type KubeResolveBuilder struct {
-	schemeName     string
-	runtimeContext context.Context
-
-	serviceNamespace string
-	portName         string
-
-	managerClient     client.Client
-	restConfig        *rest.Config
+	schemeName        string
 	controllerManager manager.Manager
+	runtimeContext    context.Context
+
+	// config details
+	defaultPortName  string
+	defaultNamespace string
+	managerClient    client.Client
+	restConfig       *rest.Config
+	zone             string
 }
 
 type KubeResolveBuilderOption func(*KubeResolveBuilder)
@@ -47,7 +51,8 @@ func NewKubeResolveBuilder(opts ...KubeResolveBuilderOption) (*KubeResolveBuilde
 
 	// default config
 	builder := &KubeResolveBuilder{
-		runtimeContext: context.Background(),
+		runtimeContext:  context.Background(),
+		defaultPortName: DefaultPortName,
 	}
 
 	// apply options
@@ -98,17 +103,27 @@ func (b *KubeResolveBuilder) Build(target resolver.Target, cc resolver.ClientCon
 
 	ctx := b.runtimeContext
 
-	res := new(KubeResolver)
-	res.grpcSecurityProtocol = opts.DialCreds.Info().SecurityProtocol
-	res.runtimeManager = b.controllerManager
-	res.clientConn = cc
-	ctx, res.closeFunc = context.WithCancel(ctx)
-	res.defaultPortName = b.portName
-	res.startSync = make(chan interface{})
+	res := &KubeResolver{
+		grpcSecurityProtocol: opts.DialCreds.Info().SecurityProtocol,
+		runtimeManager:       b.controllerManager,
+		clientConn:           cc,
+		defaultPortName:      b.defaultPortName,
+		startSync:            make(chan interface{}),
+		targetZone:           b.zone,
+	}
 
-	//TODO parse service name/namespace
-	res.Service.Name = "myservice"
-	res.Service.Namespace = "default"
+	ctx, res.closeFunc = context.WithCancel(ctx)
+
+	res.Service, res.ServicePortName, res.ServicePort, err = parseServiceNameAndNamespace(target.URL.Host)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing target host: %w", err)
+	}
+	if res.ServicePortName == "" && res.ServicePort == 0 {
+		res.ServicePortName = b.defaultPortName
+	}
+	if res.Service.Namespace == "" {
+		res.Service.Namespace = b.defaultNamespace
+	}
 
 	runtimeController, err := controller.NewUnmanaged("kuberesolver", b.controllerManager, controller.Options{
 		Reconciler: res,
@@ -130,8 +145,6 @@ func (b *KubeResolveBuilder) Build(target resolver.Target, cc resolver.ClientCon
 		return nil, fmt.Errorf("error creating controller instance: %w", err)
 	}
 
-	// Parse the namespace and service name from target
-
 	// Watch EndpointSlices for updates
 	err = runtimeController.Watch(&source.Kind{Type: &discoveryv1.EndpointSlice{}},
 		&handler.EnqueueRequestForObject{},
@@ -146,13 +159,12 @@ func (b *KubeResolveBuilder) Build(target resolver.Target, cc resolver.ClientCon
 	go func() {
 		err := runtimeController.Start(ctx)
 		log := runtimeController.GetLogger()
-		log.V(0).Info("Resolution controller stopped")
 		if err != nil {
 			log.Error(err, "Resolution controller halted with error")
 		}
+		log.V(0).Info("Resolution controller stopped")
 	}()
 
-	// wait for first resolution
 	return res, nil
 }
 
@@ -177,19 +189,25 @@ func WithClient(cli client.Client) KubeResolveBuilderOption {
 
 func WithDefaultNamespace(ns string) KubeResolveBuilderOption {
 	return func(k *KubeResolveBuilder) {
-		k.serviceNamespace = ns
+		k.defaultNamespace = ns
 	}
 }
 
 func WithDefaultPortName(name string) KubeResolveBuilderOption {
 	return func(k *KubeResolveBuilder) {
-		k.portName = name
+		k.defaultPortName = name
 	}
 }
 
 func WithRestConfig(c *rest.Config) KubeResolveBuilderOption {
 	return func(k *KubeResolveBuilder) {
 		k.restConfig = c
+	}
+}
+
+func WithTopologyAwareRouting(forZone string) KubeResolveBuilderOption {
+	return func(k *KubeResolveBuilder) {
+		k.zone = forZone
 	}
 }
 
@@ -203,4 +221,50 @@ func FilterForService(nn types.NamespacedName) predicate.Predicate {
 		}
 		return true
 	})
+}
+
+// Parse service name & namespace as service:port
+// port may be either a numeric port, a name, or omitted
+// service may be in one of the following forms:
+// - <name> (implied default namespace)
+// - <name>.<namespace>
+// - <name>.<namespace>.svc.cluster.local
+// - <name>/<namespace>
+func parseServiceNameAndNamespace(hostname string) (service types.NamespacedName, portName string, port uint16, err error) {
+	var host string
+	if strings.ContainsRune(hostname, ':') {
+		host, portName, err = net.SplitHostPort(hostname)
+		if err != nil {
+			return service, portName, port, fmt.Errorf("error parsing URL host into host:port pair: %w", err)
+		}
+	} else {
+		host = hostname
+	}
+
+	// port may be numberic or named
+	if portNo, err := strconv.ParseUint(portName, 10, 16); err == nil {
+		port = uint16(portNo)
+		portName = ""
+	}
+
+	if strings.Contains(host, "/") {
+		nameParts := strings.SplitN(host, "/", 2)
+		service.Name = nameParts[0]
+		service.Namespace = nameParts[1]
+		return
+	}
+
+	host = strings.TrimSuffix(host, ".svc.cluster.local")
+	domainParts := strings.SplitN(host, ".", 2)
+	if len(domainParts) == 1 {
+		service.Name = domainParts[0]
+		return
+	}
+	if len(domainParts) > 1 {
+		service.Name = domainParts[0]
+		service.Namespace = domainParts[1]
+		return
+	}
+
+	return service, portName, port, fmt.Errorf("unable to parse service name in any format: %s", hostname)
 }

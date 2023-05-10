@@ -7,7 +7,6 @@ import (
 	"sync/atomic"
 
 	"github.com/go-logr/logr"
-	wrr "google.golang.org/grpc/balancer/weightedroundrobin"
 	"google.golang.org/grpc/resolver"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -22,13 +21,13 @@ type KubeResolver struct {
 	Service types.NamespacedName
 
 	ServicePortName string
-	ServicePort     uint32
+	ServicePort     uint16
 
 	grpcSecurityProtocol string
 
 	runtimeManager manager.Manager
 
-	preferredZoneWeights map[string]int
+	targetZone string
 
 	clientConn resolver.ClientConn
 
@@ -49,6 +48,9 @@ const DefaultPortName = "grpc"
 var _ resolver.Resolver = &KubeResolver{}
 
 func (r *KubeResolver) Close() {
+	if r.started.CompareAndSwap(false, true) {
+		close(r.startSync)
+	}
 	r.closeFunc()
 }
 
@@ -60,6 +62,7 @@ func (r *KubeResolver) ResolveNow(resolver.ResolveNowOptions) {
 	if r.started.Load() {
 		return
 	}
+	go r.Reconcile(context.Background(), reconcile.Request{})
 	// block until started
 	<-r.startSync
 }
@@ -71,7 +74,7 @@ func (r *KubeResolver) Reconcile(ctx context.Context, req reconcile.Request) (re
 
 	reconcileLog.V(1).Info("Starting reconcile")
 
-	if r.Service.Namespace != req.Namespace {
+	if req.Namespace != "" && r.Service.Namespace != req.Namespace {
 		reconcileLog.V(0).Info("Reconcile requested on resource outside target namespace, this shouldn't happen",
 			"serviceNamespace", r.Service.Namespace)
 		return reconcile.Result{}, nil
@@ -123,6 +126,13 @@ func (r *KubeResolver) Reconcile(ctx context.Context, req reconcile.Request) (re
 func (r *KubeResolver) createState(endpointSliceList *discoveryv1.EndpointSliceList, reconcileLog logr.Logger) resolver.State {
 
 	var state resolver.State
+	useTopologyAware := true
+	if r.targetZone == "" {
+		useTopologyAware = false
+	}
+
+	var allZoneAddresses []resolver.Address
+	var targetZoneAddresses []resolver.Address
 
 	for _, slice := range endpointSliceList.Items {
 
@@ -141,7 +151,7 @@ func (r *KubeResolver) createState(endpointSliceList *discoveryv1.EndpointSliceL
 		targetPortNumber := r.ServicePort
 		if targetPortName == "" && targetPortNumber == 0 {
 			reconcileLog.V(2).Info("No ports are set, defaulting port name")
-			targetPortName = DefaultPortName
+			targetPortName = r.defaultPortName
 		}
 
 		// use port number if no name is set but number is
@@ -222,7 +232,6 @@ func (r *KubeResolver) createState(endpointSliceList *discoveryv1.EndpointSliceL
 			reconcileLog := reconcileLog.WithValues("endpointIndex", endpointIndex)
 			reconcileLog.V(2).Info("Processing endpoint")
 
-			// treat unknown Ready (nil) as Ready
 			if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
 				reconcileLog.V(2).Info("Skipping undready endpoint")
 				continue
@@ -243,23 +252,37 @@ func (r *KubeResolver) createState(endpointSliceList *discoveryv1.EndpointSliceL
 				newAddr.ServerName = *endpoint.Hostname
 			}
 
-			if hints := endpoint.Hints; hints != nil && len(r.preferredZoneWeights) > 0 {
-				reconcileLog.V(2).Info("Endpoint has hints, checking for zone preference")
-				maxWeight := 0
-				for _, zone := range hints.ForZones {
-					if weight, found := r.preferredZoneWeights[zone.Name]; found && weight > maxWeight {
-						reconcileLog.V(2).Info("Found stronger preferred zone, adjusting weight", "zone", zone.Name, "weight", weight)
-						maxWeight = weight
-					}
-				}
-				if maxWeight > 0 {
-					reconcileLog.V(2).Info("Set weighting for endpoint", "weight", maxWeight)
-					newAddr = wrr.SetAddrInfo(newAddr, wrr.AddrInfo{Weight: uint32(maxWeight)})
-				}
+			allZoneAddresses = append(allZoneAddresses, newAddr)
+
+			// don't use topology aware routing if it's not set for all endpoints
+			if useTopologyAware && endpoint.Hints == nil {
+				reconcileLog.V(1).Info("Endpoint has no zone hints, disabling topology aware routing")
+				useTopologyAware = false
 			}
 
-			state.Addresses = append(state.Addresses, newAddr)
+			if !useTopologyAware {
+				continue
+			}
+
+			for _, zone := range endpoint.Hints.ForZones {
+				if zone.Name == r.targetZone {
+					targetZoneAddresses = append(targetZoneAddresses, newAddr)
+					break
+				}
+			}
 		}
+	}
+
+	if useTopologyAware {
+		if len(targetZoneAddresses) == 0 && len(allZoneAddresses) > 0 {
+			reconcileLog.V(1).Info("No endpoints aligned with topology, but endpoints exist. Disabling topology aware routing")
+			state.Addresses = allZoneAddresses
+		} else {
+			reconcileLog.V(1).Info("Using topology aware routing, limiting to local zone", "zone", r.targetZone)
+			state.Addresses = targetZoneAddresses
+		}
+	} else {
+		state.Addresses = allZoneAddresses
 	}
 
 	return state

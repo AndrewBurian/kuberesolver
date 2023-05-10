@@ -113,6 +113,172 @@ func TestStateConstruction(t *testing.T) {
 			},
 		},
 		{
+			name: "multiple endpoints",
+			cluster: discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{
+					{
+						AddressType: discoveryv1.AddressTypeIPv4,
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								Addresses: []string{"10.0.0.1"},
+							},
+							{
+								Addresses: []string{"10.0.0.2"},
+							},
+						},
+						Ports: []discoveryv1.EndpointPort{
+							{
+								Name: &grpcPortName,
+								Port: &grpcPortNo,
+							},
+						},
+					},
+				},
+			},
+			expectState: resolver.State{
+				Addresses: []resolver.Address{
+					{
+						Addr: "10.0.0.1:8001",
+					},
+					{
+						Addr: "10.0.0.2:8001",
+					},
+				},
+			},
+		},
+		{
+			name: "topology aware endpoints",
+			cluster: discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{
+					{
+						AddressType: discoveryv1.AddressTypeIPv4,
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								Addresses: []string{"10.0.0.1"},
+								Hints: &discoveryv1.EndpointHints{
+									ForZones: []discoveryv1.ForZone{{Name: "zone-a"}},
+								},
+							},
+							{
+								Addresses: []string{"10.0.0.2"},
+								Hints: &discoveryv1.EndpointHints{
+									ForZones: []discoveryv1.ForZone{{Name: "zone-other"}},
+								},
+							},
+							{
+								Addresses: []string{"10.0.0.3"},
+								Hints: &discoveryv1.EndpointHints{
+									ForZones: []discoveryv1.ForZone{{Name: "zone-a"}},
+								},
+							},
+						},
+						Ports: []discoveryv1.EndpointPort{
+							{
+								Name: &grpcPortName,
+								Port: &grpcPortNo,
+							},
+						},
+					},
+				},
+			},
+			expectState: resolver.State{
+				Addresses: []resolver.Address{
+					{
+						Addr: "10.0.0.1:8001",
+					},
+					{
+						Addr: "10.0.0.3:8001",
+					},
+				},
+			},
+		},
+		{
+			name: "mixed topology aware endpoints",
+			cluster: discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{
+					{
+						AddressType: discoveryv1.AddressTypeIPv4,
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								Addresses: []string{"10.0.0.1"},
+								Hints: &discoveryv1.EndpointHints{
+									ForZones: []discoveryv1.ForZone{{Name: "zone-a"}},
+								},
+							},
+							{
+								Addresses: []string{"10.0.0.2"},
+							},
+							{
+								Addresses: []string{"10.0.0.3"},
+								Hints: &discoveryv1.EndpointHints{
+									ForZones: []discoveryv1.ForZone{{Name: "zone-a"}},
+								},
+							},
+						},
+						Ports: []discoveryv1.EndpointPort{
+							{
+								Name: &grpcPortName,
+								Port: &grpcPortNo,
+							},
+						},
+					},
+				},
+			},
+			expectState: resolver.State{
+				Addresses: []resolver.Address{
+					{
+						Addr: "10.0.0.1:8001",
+					},
+					{
+						Addr: "10.0.0.2:8001",
+					},
+					{
+						Addr: "10.0.0.3:8001",
+					},
+				},
+			},
+		},
+		{
+			name: "no topology aligned endpoints",
+			cluster: discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{
+					{
+						AddressType: discoveryv1.AddressTypeIPv4,
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								Addresses: []string{"10.0.0.1"},
+								Hints: &discoveryv1.EndpointHints{
+									ForZones: []discoveryv1.ForZone{{Name: "zone-other"}},
+								},
+							},
+							{
+								Addresses: []string{"10.0.0.2"},
+								Hints: &discoveryv1.EndpointHints{
+									ForZones: []discoveryv1.ForZone{{Name: "zone-other2"}},
+								},
+							},
+						},
+						Ports: []discoveryv1.EndpointPort{
+							{
+								Name: &grpcPortName,
+								Port: &grpcPortNo,
+							},
+						},
+					},
+				},
+			},
+			expectState: resolver.State{
+				Addresses: []resolver.Address{
+					{
+						Addr: "10.0.0.1:8001",
+					},
+					{
+						Addr: "10.0.0.2:8001",
+					},
+				},
+			},
+		},
+		{
 			name: "unready endpoints",
 			cluster: discoveryv1.EndpointSliceList{
 				Items: []discoveryv1.EndpointSlice{
@@ -276,6 +442,8 @@ func TestStateConstruction(t *testing.T) {
 	}
 
 	r := new(KubeResolver)
+	r.targetZone = "zone-a"
+	r.defaultPortName = grpcPortName
 
 	verbosity := 0
 	if testing.Verbose() {

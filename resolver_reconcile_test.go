@@ -44,7 +44,7 @@ var (
 )
 
 var (
-	grpcPortName  = "grpc"
+	grpcPortName  = "grpcsvc"
 	otherPortName = "metrics"
 )
 
@@ -55,6 +55,10 @@ var (
 
 func TestFullReconcile(t *testing.T) {
 
+	if testing.Short() {
+		t.Skip("Skipping long full-reconcile test")
+	}
+	
 	verbosity := 1
 	if testing.Verbose() {
 		verbosity = 3
@@ -111,6 +115,7 @@ func TestFullReconcile(t *testing.T) {
 
 	testenv := new(envtest.Environment)
 	testenv.BinaryAssetsDirectory = "/Users/andrewburian/Library/Application Support/io.kubebuilder.envtest/k8s/1.27.1-darwin-arm64"
+	t.Log("Starting testenv")
 	cfg, err := testenv.Start()
 	if err != nil {
 		t.Fatalf("Error starting test environment: %s", err)
@@ -125,6 +130,7 @@ func TestFullReconcile(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Log("Creating endpoint slices")
 	for i := range endpointSlices {
 		if err = kubeClient.Create(ctx, endpointSlices[i], client.FieldOwner("test-runner")); err != nil {
 			t.Fatalf("Error creating starting data: %s", err)
@@ -134,6 +140,8 @@ func TestFullReconcile(t *testing.T) {
 	resolveBuilder, err := NewKubeResolveBuilder(
 		WithRestConfig(cfg),
 		WithContext(ctx),
+		WithDefaultNamespace("default"),
+		WithDefaultPortName("grpcsvc"),
 	)
 	if err != nil {
 		t.Fatalf("Error creating resolve builder: %s", err)
@@ -142,7 +150,7 @@ func TestFullReconcile(t *testing.T) {
 	target := resolver.Target{
 		URL: url.URL{
 			Scheme: "kube",
-			Host:   "myservice.mynamespace:grpc",
+			Host:   "myservice:grpcsvc",
 		},
 	}
 
@@ -150,6 +158,7 @@ func TestFullReconcile(t *testing.T) {
 
 	// GRPC's process
 	// syncronously create a resolution helper
+	t.Log("Building resolver")
 	resolve, err := resolveBuilder.Build(target, conn, resolver.BuildOptions{
 		DialCreds: insecure.NewCredentials(),
 	})
@@ -158,6 +167,7 @@ func TestFullReconcile(t *testing.T) {
 	}
 
 	// when calling GRPC.Dail, synchronously call ResolveNow
+	t.Log("First ResolveNow")
 	resolve.ResolveNow(struct{}{})
 
 	if conn.err != nil {
