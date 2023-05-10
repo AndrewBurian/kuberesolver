@@ -26,6 +26,12 @@ kind: Service
 metadata:
   name: my-service
   namespace: my-ns
+  annotations:
+    service.kubernetes.io/topology-mode: Auto
+    # Enable topology aware routing with Auto, or disable explicitly with 'off'
+    # Causes kubernetes to allocate endpoints to zones close to them for less
+    # cross-zone traffic. The balancing and assignment logic is done by k8s, not kuberesolver.
+    # https://kubernetes.io/docs/concepts/services-networking/topology-aware-routing/
 spec:
   selector:
     app.kubernetes.io/name: MyGrpcApp
